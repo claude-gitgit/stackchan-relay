@@ -37,6 +37,11 @@ PORT = int(os.environ.get("PORT", "8011"))
 
 _latest: dict | None = None
 
+# ── 拍照回傳暫存 ───────────────────────────────────────
+# get_photo 丟出 photo 動作後，等韌體把 JPEG POST 回 /photo。
+_photo: bytes | None = None
+_photo_event = asyncio.Event()
+
 # ── OAuth 記憶體儲存 ───────────────────────────────────
 
 _registered_clients: dict[str, dict] = {}
@@ -94,6 +99,22 @@ STACKCHAN_TOOL = {
 }
 
 
+GET_PHOTO_TOOL = {
+    "name": "stackchan_get_photo",
+    "description": (
+        "Take a photo with the StackChan robot's camera and return the image, "
+        "so you can see what the robot is looking at on the user's desk. "
+        "The robot polls for commands every few seconds, so this can take up to "
+        "~20 seconds. Returns an error if the robot is offline or is not running "
+        "a camera-enabled firmware build."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {},
+    },
+}
+
+
 def execute_perform(actions: list[dict[str, Any]]) -> str:
     global _latest
     if not actions:
@@ -108,11 +129,58 @@ def execute_perform(actions: list[dict[str, Any]]) -> str:
     return f"Sent to StackChan: {summary}"
 
 
+async def execute_get_photo() -> dict:
+    """丟出 photo 動作，等韌體把照片 POST 回來，回傳 MCP tools/call result。"""
+    global _latest, _photo
+
+    _photo = None
+    _photo_event.clear()
+
+    # photo 動作沿用既有 /poll 通道；已有待送指令時「附加」而非覆蓋，避免蓋掉排隊中的 speak。
+    photo_action = {"type": "photo"}
+    if _latest is None:
+        _latest = {
+            "actions": [photo_action],
+            "id": f"cmd_{int(time.time() * 1000)}",
+            "ts": time.time(),
+        }
+    else:
+        _latest["actions"].append(photo_action)
+
+    logger.info("Photo requested")
+
+    try:
+        await asyncio.wait_for(_photo_event.wait(), timeout=20)
+    except asyncio.TimeoutError:
+        return {
+            "content": [{
+                "type": "text",
+                "text": ("StackChan did not return a photo in time. "
+                         "Is it powered on, online, and running a camera build?"),
+            }],
+            "isError": True,
+        }
+
+    data = _photo
+    _photo = None
+    if not data:
+        return {
+            "content": [{"type": "text", "text": "StackChan returned an empty photo."}],
+            "isError": True,
+        }
+
+    b64 = base64.b64encode(data).decode("ascii")
+    logger.info("Photo delivered: %d bytes", len(data))
+    return {
+        "content": [{"type": "image", "data": b64, "mimeType": "image/jpeg"}],
+    }
+
+
 # ══════════════════════════════════════════════════════
 #  MCP 協議處理（JSON-RPC 2.0）
 # ══════════════════════════════════════════════════════
 
-def handle_jsonrpc(msg: dict) -> dict | None:
+async def handle_jsonrpc(msg: dict) -> dict | None:
     method = msg.get("method", "")
     msg_id = msg.get("id")
     params = msg.get("params", {})
@@ -135,7 +203,7 @@ def handle_jsonrpc(msg: dict) -> dict | None:
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
-            "result": {"tools": [STACKCHAN_TOOL]},
+            "result": {"tools": [STACKCHAN_TOOL, GET_PHOTO_TOOL]},
         }
 
     if method == "tools/call":
@@ -147,6 +215,13 @@ def handle_jsonrpc(msg: dict) -> dict | None:
                 "jsonrpc": "2.0",
                 "id": msg_id,
                 "result": {"content": [{"type": "text", "text": result_text}]},
+            }
+        if name == "stackchan_get_photo":
+            result = await execute_get_photo()
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": result,
             }
         return {
             "jsonrpc": "2.0",
@@ -225,7 +300,7 @@ async def mcp_sse_handler(request: Request):
                 status_code=400,
             )
         logger.info("MCP Streamable HTTP: %s", body.get("method", "?"))
-        response = handle_jsonrpc(body)
+        response = await handle_jsonrpc(body)
         if response:
             return JSONResponse(response, headers={"Mcp-Session-Id": str(uuid.uuid4())})
         return JSONResponse(None, status_code=202)
@@ -251,7 +326,7 @@ async def mcp_messages_handler(request: Request):
         return JSONResponse({"error": "invalid json"}, status_code=400)
 
     logger.info("MCP messages: %s %s", session_id[:8], body.get("method", "?"))
-    response = handle_jsonrpc(body)
+    response = await handle_jsonrpc(body)
 
     if response:
         await queue.put(response)
@@ -402,6 +477,29 @@ async def poll(request: Request):
     return JSONResponse(cmd)
 
 
+async def photo_upload(request: Request):
+    """POST /photo?token=xxx
+    StackChan 韌體拍完照後，把 base64 編碼的 JPEG 放在 body 送過來。
+    解碼存進 _photo 並喚醒等待中的 get_photo。
+    """
+    if request.query_params.get("token") != AUTH_TOKEN:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    global _photo
+    body = await request.body()
+    try:
+        _photo = base64.b64decode(body, validate=False)
+    except Exception:
+        return JSONResponse({"error": "bad image data"}, status_code=400)
+
+    if not _photo:
+        return JSONResponse({"error": "empty image"}, status_code=400)
+
+    _photo_event.set()
+    logger.info("Photo received: %d bytes", len(_photo))
+    return JSONResponse({"ok": True, "bytes": len(_photo)})
+
+
 async def health(request: Request):
     return JSONResponse({
         "ok": True,
@@ -428,6 +526,7 @@ app = Starlette(
         Route("/mcp/messages", mcp_messages_handler, methods=["POST"]),
         # Relay
         Route("/poll", poll, methods=["GET"]),
+        Route("/photo", photo_upload, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
     ],
 )
