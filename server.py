@@ -37,6 +37,11 @@ PORT = int(os.environ.get("PORT", "8011"))
 
 _latest: dict | None = None
 
+# ── 事件佇列（通用：head_pat / hug / voice_message 等）──
+_events: list[dict] = []
+_events_lock = asyncio.Lock()
+MAX_EVENTS = 100
+
 # ── 拍照回傳暫存 ───────────────────────────────────────
 # get_photo 丟出 photo 動作後，等韌體把 JPEG POST 回 /photo。
 _photo: bytes | None = None
@@ -115,6 +120,25 @@ GET_PHOTO_TOOL = {
 }
 
 
+CHECK_EVENTS_TOOL = {
+    "name": "stackchan_check_events",
+    "description": (
+        "Check recent events reported by StackChan (head pats, hugs, sensor readings, "
+        "voice messages, etc). Returns a list of events since last check. "
+        "Events are cleared after reading by default."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "keep": {
+                "type": "boolean",
+                "description": "If true, don't clear events after reading (peek mode). Default false.",
+            }
+        },
+    },
+}
+
+
 def execute_perform(actions: list[dict[str, Any]]) -> str:
     global _latest
     if not actions:
@@ -176,6 +200,17 @@ async def execute_get_photo() -> dict:
     }
 
 
+async def execute_check_events(keep: bool = False) -> dict:
+    async with _events_lock:
+        snapshot = list(_events)
+        if not keep:
+            _events.clear()
+    logger.info("Events checked: %d events%s", len(snapshot), " (kept)" if keep else "")
+    return {
+        "content": [{"type": "text", "text": json.dumps(snapshot)}],
+    }
+
+
 # ══════════════════════════════════════════════════════
 #  MCP 協議處理（JSON-RPC 2.0）
 # ══════════════════════════════════════════════════════
@@ -203,7 +238,7 @@ async def handle_jsonrpc(msg: dict) -> dict | None:
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
-            "result": {"tools": [STACKCHAN_TOOL, GET_PHOTO_TOOL]},
+            "result": {"tools": [STACKCHAN_TOOL, GET_PHOTO_TOOL, CHECK_EVENTS_TOOL]},
         }
 
     if method == "tools/call":
@@ -218,6 +253,13 @@ async def handle_jsonrpc(msg: dict) -> dict | None:
             }
         if name == "stackchan_get_photo":
             result = await execute_get_photo()
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": result,
+            }
+        if name == "stackchan_check_events":
+            result = await execute_check_events(keep=args.get("keep", False))
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -500,6 +542,35 @@ async def photo_upload(request: Request):
     return JSONResponse({"ok": True, "bytes": len(_photo)})
 
 
+async def events_post(request: Request):
+    """POST /events?token=xxx — firmware 回報感測事件"""
+    if request.query_params.get("token") != AUTH_TOKEN:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    evt_type = body.get("type")
+    if not evt_type or not isinstance(evt_type, str):
+        return JSONResponse({"error": "missing or invalid 'type'"}, status_code=400)
+
+    event = {
+        "type": evt_type,
+        "timestamp": body.get("timestamp", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+        "data": body.get("data", {}),
+    }
+
+    async with _events_lock:
+        _events.append(event)
+        if len(_events) > MAX_EVENTS:
+            _events[:] = _events[-MAX_EVENTS:]
+
+    logger.info("Event received: %s", evt_type)
+    return JSONResponse({"ok": True})
+
+
 async def health(request: Request):
     return JSONResponse({
         "ok": True,
@@ -527,6 +598,7 @@ app = Starlette(
         # Relay
         Route("/poll", poll, methods=["GET"]),
         Route("/photo", photo_upload, methods=["POST"]),
+        Route("/events", events_post, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
     ],
 )
