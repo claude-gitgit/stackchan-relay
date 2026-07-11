@@ -19,6 +19,7 @@ import uuid
 from typing import Any
 from urllib.parse import urlencode
 
+import httpx
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -571,6 +572,120 @@ async def events_post(request: Request):
     return JSONResponse({"ok": True})
 
 
+# ── Gemini Search Grounding 代理 ───────────────────────
+# 韌體照舊用 OpenAI 格式打 /chat/completions，這裡翻譯成 Gemini 原生
+# generateContent 並開啟 google_search grounding，再翻回 OpenAI 格式。
+# 韌體端解析 buffer 只有 2KB，回應必須精簡（丟 groundingMetadata、截斷 content）。
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_BASE = os.environ.get("GEMINI_BASE", "https://generativelanguage.googleapis.com")
+GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "25"))
+# 韌體解析 pool 為 2000 bytes；中文 1 字 3 bytes + ArduinoJson 結構開銷約 600 bytes，
+# 300 字（900 bytes）留足餘裕。
+CONTENT_MAX_CHARS = 300
+FALLBACK_TEXT = "我剛剛恍神了，再說一次好嗎？"
+
+
+def _openai_to_gemini(body: dict) -> tuple[str, dict]:
+    """OpenAI chat completion 請求 → Gemini generateContent payload。"""
+    model = body.get("model") or "gemini-2.5-flash"
+    system_parts: list[str] = []
+    contents: list[dict] = []
+    for msg in body.get("messages", []):
+        role = msg.get("role")
+        content = msg.get("content")
+        if not isinstance(content, str) or content == "":
+            continue  # 韌體只送純文字，其他形態忽略
+        if role == "system":
+            system_parts.append(content)
+        elif role in ("user", "assistant"):
+            contents.append({
+                "role": "user" if role == "user" else "model",
+                "parts": [{"text": content}],
+            })
+    payload: dict = {
+        "contents": contents,
+        "tools": [{"google_search": {}}],
+    }
+    if system_parts:
+        payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
+    if isinstance(body.get("temperature"), (int, float)):
+        payload["generationConfig"] = {"temperature": body["temperature"]}
+    return model, payload
+
+
+def _extract_text(data: dict) -> str:
+    """Gemini 回應取出純文字，丟棄 groundingMetadata/citations。"""
+    try:
+        parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts).strip()
+    except (AttributeError, IndexError, TypeError):
+        return ""
+    return text[:CONTENT_MAX_CHARS]
+
+
+def _openai_response(text: str, model: str) -> JSONResponse:
+    """組最小可用的 OpenAI chat completion JSON（韌體只讀 content）。"""
+    return JSONResponse({
+        "id": "chatcmpl-relay",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    })
+
+
+async def chat_completions(request: Request):
+    """POST /chat/completions?token=xxx — OpenAI 相容的 Gemini grounding 代理。"""
+    if request.query_params.get("token") != AUTH_TOKEN:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    model, payload = _openai_to_gemini(body)
+    url = f"{GEMINI_BASE}/v1beta/models/{model}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_API_KEY}
+    t0 = time.monotonic()
+
+    data: dict | None = None
+    async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT) as client:
+        try:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code in (400, 429):
+                # grounding quota（429）或相容性問題（400）→ 拿掉 tools 降級重試一次
+                logger.warning("Gemini %d, retry without tools: %s",
+                               resp.status_code, resp.text[:200])
+                payload.pop("tools", None)
+                resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error("Gemini request failed: %r", e)
+
+    elapsed = time.monotonic() - t0
+    if data is None:
+        # 逾時或最終失敗：回固定訊息讓 TTS 有東西可念，不對韌體回 5xx
+        logger.error("Chat fallback after %.1fs", elapsed)
+        return _openai_response(FALLBACK_TEXT, model)
+
+    text = _extract_text(data)
+    if not text:
+        logger.warning("Gemini empty text: %s", json.dumps(data)[:300])
+        text = FALLBACK_TEXT
+
+    grounded = bool((data.get("candidates") or [{}])[0].get("groundingMetadata"))
+    logger.info("Chat ok: %.1fs grounded=%s len=%d", elapsed, grounded, len(text))
+    return _openai_response(text, model)
+
+
 async def health(request: Request):
     return JSONResponse({
         "ok": True,
@@ -597,6 +712,7 @@ app = Starlette(
         Route("/mcp/messages", mcp_messages_handler, methods=["POST"]),
         # Relay
         Route("/poll", poll, methods=["GET"]),
+        Route("/chat/completions", chat_completions, methods=["POST"]),
         Route("/photo", photo_upload, methods=["POST"]),
         Route("/events", events_post, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
