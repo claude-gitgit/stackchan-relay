@@ -584,6 +584,11 @@ GEMINI_TIMEOUT = float(os.environ.get("GEMINI_TIMEOUT", "25"))
 # 300 字（900 bytes）留足餘裕。
 CONTENT_MAX_CHARS = 300
 FALLBACK_TEXT = "我剛剛恍神了，再說一次好嗎？"
+# grounding 搜尋結果會讓模型變得話癆、無視 role prompt 的字數限制；長回答會塞爆
+# 韌體的 2KB 解析 buffer 與對話歷史（heap 壓力 → SSL 連線失敗），故強制精簡。
+BREVITY_NOTE = ("重要：你的回答會被機器人念出來，必須口語化且精簡。"
+                "即使參考了搜尋結果，也只挑最關鍵的資訊，用 1 到 3 句話、"
+                "100 字以內總結。絕對不要列點、不要分段、不要提供多個主題。")
 
 
 def _openai_to_gemini(body: dict) -> tuple[str, dict]:
@@ -607,8 +612,8 @@ def _openai_to_gemini(body: dict) -> tuple[str, dict]:
         "contents": contents,
         "tools": [{"google_search": {}}],
     }
-    if system_parts:
-        payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
+    system_parts.append(BREVITY_NOTE)
+    payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
     if isinstance(body.get("temperature"), (int, float)):
         payload["generationConfig"] = {"temperature": body["temperature"]}
     return model, payload
