@@ -13,6 +13,7 @@ import secrets
 import hashlib
 import base64
 import json
+import html
 import logging
 import asyncio
 import uuid
@@ -22,7 +23,12 @@ from urllib.parse import urlencode
 import httpx
 from starlette.applications import Starlette
 from starlette.routing import Route
-from starlette.responses import JSONResponse, RedirectResponse, StreamingResponse
+from starlette.responses import (
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+    HTMLResponse,
+)
 from starlette.requests import Request
 
 # ── 設定 ──────────────────────────────────────────────
@@ -33,6 +39,11 @@ logger = logging.getLogger("stackchan")
 
 AUTH_TOKEN = os.environ.get("STACKCHAN_TOKEN", "please-set-a-token")
 PORT = int(os.environ.get("PORT", "8011"))
+
+# OAuth /authorize 的部署密鑰：優先用專屬的 STACKCHAN_OAUTH_SECRET，
+# 未設定時 fall back 到韌體用的 STACKCHAN_TOKEN。兩者皆為預設 / 空值時 fail-closed。
+OAUTH_SECRET = os.environ.get("STACKCHAN_OAUTH_SECRET") or os.environ.get("STACKCHAN_TOKEN", "")
+INSECURE_SECRETS = {"", "please-set-a-token"}
 
 # ── 指令暫存（latest-only）─────────────────────────────
 
@@ -294,11 +305,37 @@ def get_external_base(request: Request) -> str:
     return f"{proto}://{host}"
 
 
+def check_bearer(request: Request) -> bool:
+    """驗證 Authorization: Bearer <token> 是否為已核發的 access token。"""
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    token = auth[len("Bearer "):].strip()
+    return token in _access_tokens
+
+
+def unauthorized_mcp(request: Request) -> JSONResponse:
+    """MCP 端點的 401：附 WWW-Authenticate 指向 protected-resource metadata，
+    讓 claude.ai 知道要（重新）走 OAuth。redeploy 後 token 失效即靠這觸發重連。"""
+    base = get_external_base(request)
+    return JSONResponse(
+        {"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": "Unauthorized"}},
+        status_code=401,
+        headers={
+            "WWW-Authenticate":
+                f'Bearer resource_metadata="{base}/.well-known/oauth-protected-resource"',
+        },
+    )
+
+
 async def mcp_sse_handler(request: Request):
     """
     GET  /mcp/sse → SSE 傳輸
     POST /mcp/sse → Streamable HTTP 傳輸
     """
+    if request.method in ("GET", "POST") and not check_bearer(request):
+        return unauthorized_mcp(request)
+
     if request.method == "GET":
         session_id = str(uuid.uuid4())
         queue: asyncio.Queue = asyncio.Queue()
@@ -356,6 +393,9 @@ async def mcp_sse_handler(request: Request):
 
 async def mcp_messages_handler(request: Request):
     """POST /mcp/messages — SSE 傳輸的訊息接收端"""
+    if not check_bearer(request):
+        return unauthorized_mcp(request)
+
     session_id = request.query_params.get("session_id", "")
     queue = _sessions.get(session_id)
 
@@ -439,8 +479,55 @@ async def oauth_register(request: Request):
     )
 
 
-async def oauth_authorize(request: Request):
-    params = dict(request.query_params)
+_AUTHORIZE_FIELDS = (
+    "client_id", "redirect_uri", "state",
+    "code_challenge", "code_challenge_method", "response_type", "scope",
+)
+
+
+def _render_authorize_form(params: dict, error: str = "") -> HTMLResponse:
+    """顯示部署密鑰登入表單，把原始 OAuth 參數以 hidden 欄位帶著。"""
+    hidden = "\n".join(
+        f'  <input type="hidden" name="{f}" value="{html.escape(params.get(f, "") or "", quote=True)}">'
+        for f in _AUTHORIZE_FIELDS
+    )
+    error_html = f'<p class="err">{html.escape(error)}</p>' if error else ""
+    page = f"""<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StackChan Relay 授權</title>
+<style>
+  body {{ font-family: -apple-system, system-ui, sans-serif; background:#f5f5f7;
+         display:flex; min-height:100vh; margin:0; align-items:center; justify-content:center; }}
+  form {{ background:#fff; padding:2rem 2.25rem; border-radius:16px;
+          box-shadow:0 8px 30px rgba(0,0,0,.08); width:min(90vw,360px); box-sizing:border-box; }}
+  h1 {{ font-size:1.15rem; margin:0 0 .25rem; }}
+  p.sub {{ color:#666; font-size:.85rem; margin:0 0 1.25rem; }}
+  p.err {{ color:#c0392b; font-size:.85rem; margin:0 0 .75rem; }}
+  input[type=password] {{ width:100%; padding:.7rem .8rem; font-size:1rem; border:1px solid #d0d0d5;
+         border-radius:10px; box-sizing:border-box; margin-bottom:1rem; }}
+  button {{ width:100%; padding:.7rem; font-size:1rem; border:0; border-radius:10px;
+            background:#0a84ff; color:#fff; cursor:pointer; }}
+</style>
+</head>
+<body>
+<form method="post" action="/oauth/authorize">
+  <h1>🤖 StackChan Relay 授權</h1>
+  <p class="sub">請輸入部署密鑰以連接 claude.ai。</p>
+{error_html}
+  <input type="password" name="secret" placeholder="部署密鑰" autofocus autocomplete="off">
+{hidden}
+  <button type="submit">授權</button>
+</form>
+</body>
+</html>"""
+    return HTMLResponse(page, status_code=401 if error else 200)
+
+
+def _issue_auth_code(params: dict) -> RedirectResponse:
+    """密鑰通過後，產生 auth code 並 302 導回 redirect_uri。"""
     redirect_uri = params.get("redirect_uri", "")
     state = params.get("state", "")
 
@@ -453,7 +540,7 @@ async def oauth_authorize(request: Request):
         "expires": time.time() + 600,
     }
 
-    logger.info("OAuth: authorize auto-approved")
+    logger.info("OAuth: authorize approved for %s", (params.get("client_id", "") or "?")[:16])
     redir_params = {"code": code}
     if state:
         redir_params["state"] = state
@@ -463,6 +550,27 @@ async def oauth_authorize(request: Request):
         f"{redirect_uri}{separator}{urlencode(redir_params)}",
         status_code=302,
     )
+
+
+async def oauth_authorize(request: Request):
+    """GET → 顯示密鑰表單；POST → 驗證部署密鑰後才核發 code（不再自動批准）。"""
+    if request.method == "GET":
+        return _render_authorize_form(dict(request.query_params))
+
+    form = dict(await request.form())
+
+    # Fail-closed：未設定部署密鑰時一律拒發，避免 OAuth 又變成大門敞開。
+    if OAUTH_SECRET in INSECURE_SECRETS:
+        logger.error("OAuth: authorize refused — STACKCHAN_OAUTH_SECRET/STACKCHAN_TOKEN not set")
+        return _render_authorize_form(
+            form, "伺服器未設定部署密鑰（STACKCHAN_OAUTH_SECRET），請聯絡管理員。")
+
+    submitted = form.get("secret", "")
+    if not secrets.compare_digest(submitted.encode("utf-8"), OAUTH_SECRET.encode("utf-8")):
+        logger.warning("OAuth: authorize rejected — bad secret")
+        return _render_authorize_form(form, "密鑰錯誤，請再試一次。")
+
+    return _issue_auth_code(form)
 
 
 async def oauth_token(request: Request):
@@ -487,10 +595,17 @@ async def oauth_token(request: Request):
     if not stored or stored["expires"] < time.time():
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
-    if stored.get("code_challenge") and code_verifier:
+    # authorize 當時存了 challenge 就強制驗 PKCE：不送 code_verifier 不再能繞過。
+    challenge = stored.get("code_challenge")
+    if challenge:
+        if not code_verifier:
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": "code_verifier required"},
+                status_code=400,
+            )
         digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
         expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-        if expected != stored["code_challenge"]:
+        if not secrets.compare_digest(expected, challenge):
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
     access_token = secrets.token_hex(32)
@@ -593,7 +708,7 @@ BREVITY_NOTE = ("重要：你的回答會被機器人念出來，必須口語化
 
 def _openai_to_gemini(body: dict) -> tuple[str, dict]:
     """OpenAI chat completion 請求 → Gemini generateContent payload。"""
-    model = body.get("model") or "gemini-2.5-flash"
+    model = body.get("model") or "gemini-3.5-flash"
     system_parts: list[str] = []
     contents: list[dict] = []
     for msg in body.get("messages", []):
@@ -710,7 +825,7 @@ app = Starlette(
         Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
         Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]),
         Route("/oauth/register", oauth_register, methods=["GET", "POST"]),
-        Route("/oauth/authorize", oauth_authorize, methods=["GET"]),
+        Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]),
         Route("/oauth/token", oauth_token, methods=["POST"]),
         # MCP（手動實作，支援 SSE + Streamable HTTP）
         Route("/mcp/sse", mcp_sse_handler, methods=["GET", "POST", "DELETE"]),
