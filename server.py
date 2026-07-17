@@ -18,7 +18,7 @@ import logging
 import asyncio
 import uuid
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, parse_qs
 
 import httpx
 from starlette.applications import Starlette
@@ -305,6 +305,14 @@ def get_external_base(request: Request) -> str:
     return f"{proto}://{host}"
 
 
+async def parse_urlencoded_form(request: Request) -> dict:
+    """解析 application/x-www-form-urlencoded body，不依賴 python-multipart。
+    （Starlette 的 request.form() 需要 python-multipart，本專案未安裝。）"""
+    raw = (await request.body()).decode("utf-8", errors="replace")
+    parsed = parse_qs(raw, keep_blank_values=True)
+    return {k: v[-1] for k, v in parsed.items()}
+
+
 def check_bearer(request: Request) -> bool:
     """驗證 Authorization: Bearer <token> 是否為已核發的 access token。"""
     auth = request.headers.get("authorization", "")
@@ -557,7 +565,7 @@ async def oauth_authorize(request: Request):
     if request.method == "GET":
         return _render_authorize_form(dict(request.query_params))
 
-    form = dict(await request.form())
+    form = await parse_urlencoded_form(request)
 
     # Fail-closed：未設定部署密鑰時一律拒發，避免 OAuth 又變成大門敞開。
     if OAUTH_SECRET in INSECURE_SECRETS:
@@ -577,8 +585,7 @@ async def oauth_token(request: Request):
     content_type = request.headers.get("content-type", "")
 
     if "application/x-www-form-urlencoded" in content_type:
-        form = await request.form()
-        body = dict(form)
+        body = await parse_urlencoded_form(request)
     elif "application/json" in content_type:
         body = await request.json()
     else:
